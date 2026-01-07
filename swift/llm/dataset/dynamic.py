@@ -1,4 +1,3 @@
-# Copyright (c) Alibaba, Inc. and its affiliates.
 """
 Dynamic Directory Streaming Dataset
 
@@ -10,7 +9,7 @@ training consumes them.
 Use Case:
     - Producer thread downloads data from remote storage (S3, R2, etc.)
     - Converts to JSONL and writes to a local buffer directory
-    - Training reads from the buffer using --streaming true --dynamic_files true
+    - Training reads from the buffer using --streaming true --rescan_files true
     - As new files appear, training automatically picks them up
 
 The standard HuggingFace load_dataset(..., streaming=True) snapshots the file
