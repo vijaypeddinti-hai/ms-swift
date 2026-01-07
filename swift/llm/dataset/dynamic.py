@@ -58,6 +58,10 @@ class DynamicDirectoryDataset(IterableDataset):
         min_file_age_seconds: Only read files older than this (avoids partial writes).
         transform: Optional function to transform each sample dict.
         seed: Random seed for shuffling.
+        mark_completed: If True, create a .completed marker file after reading each
+            data file. Files with markers are skipped on subsequent scans. This enables
+            producer-consumer coordination: producer can safely delete files that have
+            .completed markers. Default: True.
 
     Example:
         >>> dataset = DynamicDirectoryDataset(
@@ -81,6 +85,7 @@ class DynamicDirectoryDataset(IterableDataset):
         min_file_age_seconds: float = 1.0,
         transform: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
         seed: Optional[int] = None,
+        mark_completed: bool = True,
     ):
         self.directory = Path(directory)
         self.file_pattern = file_pattern
@@ -92,18 +97,39 @@ class DynamicDirectoryDataset(IterableDataset):
         self.min_file_age_seconds = min_file_age_seconds
         self.transform = transform
         self.seed = seed
+        self.mark_completed = mark_completed
 
         self._rng = random.Random(seed)
         self._cycle = 0
 
+    def _get_completed_marker_path(self, data_file: Path) -> Path:
+        """Get the path to the .completed marker file for a data file."""
+        return data_file.with_suffix(data_file.suffix + '.completed')
+
+    def _is_completed(self, data_file: Path) -> bool:
+        """Check if a data file has been marked as completed."""
+        return self._get_completed_marker_path(data_file).exists()
+
+    def _mark_as_completed(self, data_file: Path) -> None:
+        """Create a .completed marker file for a data file."""
+        marker_path = self._get_completed_marker_path(data_file)
+        try:
+            marker_path.touch()
+            logger.debug(f"Marked as completed: {data_file.name}")
+        except (OSError, IOError) as e:
+            logger.warning(f"Failed to create completion marker for {data_file}: {e}")
+
     def _scan_directory(self) -> List[Path]:
-        """Scan directory for matching files, respecting min_file_age_seconds."""
+        """Scan directory for matching files, skipping completed ones."""
         now = time.time()
         files = []
         if not self.directory.exists():
             return files
         for path in self.directory.glob(self.file_pattern):
             if path.is_file():
+                # Skip files that have been marked as completed
+                if self.mark_completed and self._is_completed(path):
+                    continue
                 # Skip files that are too new (might still be written)
                 try:
                     file_age = now - path.stat().st_mtime
@@ -224,12 +250,18 @@ class DynamicDirectoryDataset(IterableDataset):
         # Create sample iterator over all files
         def sample_generator():
             for file_path in files:
+                sample_count_in_file = 0
                 for sample in self._read_file(file_path):
                     if self.transform:
                         sample = self.transform(sample)
                         if sample is None:
                             continue
+                    sample_count_in_file += 1
                     yield sample
+                # Mark file as completed after reading all samples
+                if self.mark_completed and sample_count_in_file > 0:
+                    self._mark_as_completed(file_path)
+                    logger.info(f"[DynamicDirectoryDataset] Completed: {file_path.name} ({sample_count_in_file} samples)")
 
         # Apply shuffle buffer if requested
         if self.shuffle:
@@ -257,6 +289,7 @@ def load_dynamic_directory_dataset(
     shuffle_buffer_size: int = 1000,
     wait_for_files: bool = True,
     seed: Optional[int] = None,
+    mark_completed: bool = True,
     **kwargs,
 ) -> DynamicDirectoryDataset:
     """Load a dynamic streaming dataset from a directory.
@@ -272,6 +305,8 @@ def load_dynamic_directory_dataset(
         shuffle_buffer_size: Size of shuffle buffer.
         wait_for_files: Wait for files if directory is empty.
         seed: Random seed for shuffling.
+        mark_completed: Create .completed marker after reading each file.
+            Producer can safely delete files with markers. Default: True.
         **kwargs: Additional arguments passed to DynamicDirectoryDataset.
 
     Returns:
@@ -292,5 +327,6 @@ def load_dynamic_directory_dataset(
         shuffle_buffer_size=shuffle_buffer_size,
         wait_for_files=wait_for_files,
         seed=seed,
+        mark_completed=mark_completed,
         **kwargs,
     )
