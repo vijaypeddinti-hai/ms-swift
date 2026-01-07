@@ -11,6 +11,7 @@ from .preprocessor import (AlpacaPreprocessor, AutoPreprocessor, MessagesPreproc
 from .register import DATASET_MAPPING, DatasetMeta, SubsetDataset, register_dataset, register_dataset_info
 from .utils import (AddLengthPreprocessor, EncodePreprocessor, IterablePackingDataset, LazyLLMDataset, PackingDataset,
                     sample_dataset)
+from .dynamic import DynamicDirectoryDataset, load_dynamic_directory_dataset
 
 datasets.fingerprint.get_temporary_cache_files_directory = get_temporary_cache_files_directory
 datasets.arrow_dataset.get_temporary_cache_files_directory = get_temporary_cache_files_directory
