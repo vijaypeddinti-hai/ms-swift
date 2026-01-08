@@ -1,0 +1,359 @@
+"""
+Lazy Sharded Dataset for Megatron-SWIFT distributed training.
+
+Each data parallel rank independently loads only its assigned chunk files:
+    chunk_idx % data_parallel_size == data_parallel_rank
+
+This uses the efficient non-streaming path (MegatronPretrainingRandomSampler)
+instead of the bottlenecked streaming path (MegatronDataLoaderDispatcher).
+
+Key insight: With data_sharding=True (default), each DP rank gets contiguous
+blocks of indices, which aligns with modulo-based chunk assignment.
+
+Usage:
+    megatron sft \
+        --model /path/to/model \
+        --dataset /workspace/data/chunks \
+        --sharded_lazy true \
+        --sharded_lazy_samples_per_chunk 1000 \
+        --max_steps 20000
+
+Producer must write chunks with sequential naming:
+    chunk_00000.jsonl, chunk_00001.jsonl, chunk_00002.jsonl, ...
+"""
+
+import json
+import time
+import re
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Union
+
+import torch.distributed as dist
+from torch.utils.data import Dataset
+
+from swift.utils import get_logger
+
+logger = get_logger()
+
+
+def get_data_parallel_info() -> tuple:
+    """Get data parallel rank and world size.
+
+    Tries Megatron's mpu first, falls back to torch.distributed.
+
+    Returns:
+        Tuple of (dp_rank, dp_world_size)
+    """
+    try:
+        from megatron.core import mpu
+        if mpu.is_initialized():
+            return mpu.get_data_parallel_rank(), mpu.get_data_parallel_world_size()
+    except ImportError:
+        pass
+
+    if dist.is_initialized():
+        return dist.get_rank(), dist.get_world_size()
+
+    return 0, 1
+
+
+class LazyShardedDataset(Dataset):
+    """Map-style dataset where each DP rank reads only its assigned chunks.
+
+    Chunks are assigned via modulo: chunk_idx % dp_world_size == dp_rank
+
+    This dataset:
+    - Provides __len__() so it uses MegatronPretrainingRandomSampler (efficient)
+    - Does NOT use MegatronDataLoaderDispatcher (bottleneck)
+    - Each rank loads its assigned chunks lazily (waits if not yet available)
+    - Encodes samples with return_length=True for padding_free compatibility
+
+    With data_sharding=True (the default), MegatronPretrainingRandomSampler gives
+    each rank contiguous blocks of indices:
+        - Rank 0: indices [0, bucket_size)
+        - Rank 1: indices [bucket_size, 2*bucket_size)
+        - etc.
+
+    This aligns with our chunk assignment where:
+        - Chunk 0 contains samples [0, samples_per_chunk)
+        - Chunk 1 contains samples [samples_per_chunk, 2*samples_per_chunk)
+        - etc.
+
+    Args:
+        directory: Path to directory containing chunk files (chunk_00000.jsonl, etc.)
+        encode_fn: Function to encode samples (typically template.encode)
+        samples_per_chunk: Expected samples per chunk file
+        max_total_samples: Upper bound for __len__() - training stops via max_steps
+        wait_poll_interval: Seconds between polls when waiting for chunks
+        max_wait_time: Maximum seconds to wait for a chunk (0 = wait forever)
+        mark_completed: Create .completed marker after fully reading a chunk
+        chunk_pattern: Regex to extract chunk index from filename
+        dp_rank: Override data parallel rank (default: auto-detect)
+        dp_world_size: Override data parallel world size (default: auto-detect)
+    """
+
+    def __init__(
+        self,
+        directory: Union[str, Path],
+        encode_fn: Callable[[Dict[str, Any], bool], Optional[Dict[str, Any]]],
+        samples_per_chunk: int = 1000,
+        max_total_samples: int = 100_000_000,
+        wait_poll_interval: float = 5.0,
+        max_wait_time: float = 0,
+        mark_completed: bool = True,
+        chunk_pattern: str = r'chunk_(\d+)\.jsonl',
+        dp_rank: Optional[int] = None,
+        dp_world_size: Optional[int] = None,
+    ):
+        self.directory = Path(directory)
+        self.encode_fn = encode_fn
+        self.samples_per_chunk = samples_per_chunk
+        self.max_total_samples = max_total_samples
+        self.wait_poll_interval = wait_poll_interval
+        self.max_wait_time = max_wait_time
+        self.mark_completed = mark_completed
+        self.chunk_pattern = re.compile(chunk_pattern)
+
+        # Get Megatron data parallel info
+        if dp_rank is not None and dp_world_size is not None:
+            self.dp_rank = dp_rank
+            self.dp_world_size = dp_world_size
+        else:
+            self.dp_rank, self.dp_world_size = get_data_parallel_info()
+
+        # Cache: chunk_idx -> list of encoded samples
+        self._chunk_cache: Dict[int, List[Dict[str, Any]]] = {}
+
+        # Track chunks we've fully processed
+        self._completed_chunks: set = set()
+
+        logger.info(
+            f'[LazyShardedDataset] Initialized: dp_rank={self.dp_rank}/{self.dp_world_size}, '
+            f'directory={self.directory}, samples_per_chunk={samples_per_chunk}'
+        )
+
+    def __len__(self) -> int:
+        """Return max_total_samples.
+
+        Training stops via --max_steps, not dataset exhaustion.
+        This large number ensures BatchSamplerShard treats us as a sized dataset.
+        """
+        return self.max_total_samples
+
+    def _is_my_chunk(self, chunk_idx: int) -> bool:
+        """Check if this chunk is assigned to this DP rank."""
+        return chunk_idx % self.dp_world_size == self.dp_rank
+
+    def _chunk_path(self, chunk_idx: int) -> Path:
+        """Get expected path for a chunk index."""
+        return self.directory / f'chunk_{chunk_idx:05d}.jsonl'
+
+    def _completed_marker_path(self, chunk_path: Path) -> Path:
+        """Get .completed marker path for a chunk."""
+        return chunk_path.with_suffix(chunk_path.suffix + '.completed')
+
+    def _wait_for_chunk(self, chunk_idx: int) -> Optional[Path]:
+        """Wait for a chunk file to appear on disk.
+
+        Args:
+            chunk_idx: The chunk index to wait for
+
+        Returns:
+            Path to the chunk file, or None if timeout/already completed
+        """
+        chunk_path = self._chunk_path(chunk_idx)
+        completed_marker = self._completed_marker_path(chunk_path)
+        start_time = time.time()
+        logged_waiting = False
+
+        while True:
+            # Check if chunk exists
+            if chunk_path.exists():
+                # Brief delay to ensure file is fully written
+                file_mtime = chunk_path.stat().st_mtime
+                if time.time() - file_mtime > 1.0:
+                    return chunk_path
+                # File is very new, wait a bit
+                time.sleep(1.0)
+                continue
+
+            # Check if already completed (was processed and deleted by producer)
+            if completed_marker.exists():
+                logger.debug(f'[LazyShardedDataset] Chunk {chunk_idx} already completed')
+                return None
+
+            # Check timeout
+            elapsed = time.time() - start_time
+            if self.max_wait_time > 0 and elapsed > self.max_wait_time:
+                logger.warning(
+                    f'[LazyShardedDataset] Rank {self.dp_rank}: Timeout after {elapsed:.1f}s '
+                    f'waiting for chunk {chunk_idx}'
+                )
+                return None
+
+            # Log waiting message (once)
+            if not logged_waiting:
+                logger.info(
+                    f'[LazyShardedDataset] Rank {self.dp_rank}: Waiting for chunk {chunk_idx} '
+                    f'({chunk_path.name})...'
+                )
+                logged_waiting = True
+
+            time.sleep(self.wait_poll_interval)
+
+    def _load_chunk(self, chunk_idx: int) -> List[Dict[str, Any]]:
+        """Load and encode all samples from a chunk file.
+
+        Args:
+            chunk_idx: The chunk index to load
+
+        Returns:
+            List of encoded samples from the chunk
+        """
+        # Return cached if available
+        if chunk_idx in self._chunk_cache:
+            return self._chunk_cache[chunk_idx]
+
+        # Verify this chunk belongs to this rank
+        if not self._is_my_chunk(chunk_idx):
+            logger.warning(
+                f'[LazyShardedDataset] Rank {self.dp_rank} asked for chunk {chunk_idx} '
+                f'but it belongs to rank {chunk_idx % self.dp_world_size}'
+            )
+            return []
+
+        # Wait for chunk to appear
+        chunk_path = self._wait_for_chunk(chunk_idx)
+        if chunk_path is None:
+            return []
+
+        # Load and encode samples
+        samples = []
+        errors = 0
+        try:
+            with open(chunk_path, 'r', encoding='utf-8') as f:
+                for line_num, line in enumerate(f, 1):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        raw = json.loads(line)
+                        # CRITICAL: return_length=True for Megatron's padding_free mode
+                        encoded = self.encode_fn(raw, return_length=True)
+                        if encoded is not None:
+                            samples.append(encoded)
+                    except json.JSONDecodeError as e:
+                        errors += 1
+                        if errors <= 3:
+                            logger.warning(f'Invalid JSON at {chunk_path.name}:{line_num}: {e}')
+                    except Exception as e:
+                        errors += 1
+                        if errors <= 3:
+                            logger.warning(f'Encoding error at {chunk_path.name}:{line_num}: {e}')
+
+            if errors > 3:
+                logger.warning(f'[LazyShardedDataset] {errors} total errors in chunk {chunk_idx}')
+
+            logger.info(
+                f'[LazyShardedDataset] Rank {self.dp_rank}: Loaded chunk {chunk_idx} '
+                f'({len(samples)} samples from {chunk_path.name})'
+            )
+
+            # Mark as completed so producer can delete this chunk
+            if self.mark_completed and samples:
+                try:
+                    self._completed_marker_path(chunk_path).touch()
+                    logger.debug(f'[LazyShardedDataset] Created completion marker for chunk {chunk_idx}')
+                except OSError as e:
+                    logger.warning(f'Failed to create completion marker for chunk {chunk_idx}: {e}')
+
+        except FileNotFoundError:
+            logger.warning(f'[LazyShardedDataset] Chunk {chunk_idx} disappeared while reading')
+            return []
+        except Exception as e:
+            logger.error(f'[LazyShardedDataset] Error reading chunk {chunk_idx}: {e}')
+            return []
+
+        # Cache the loaded samples
+        self._chunk_cache[chunk_idx] = samples
+        return samples
+
+    def _global_idx_to_chunk_and_offset(self, global_idx: int) -> tuple:
+        """Map global sample index to (chunk_idx, sample_offset_in_chunk).
+
+        Global index space:
+            Samples [0, samples_per_chunk) are in chunk 0
+            Samples [samples_per_chunk, 2*samples_per_chunk) are in chunk 1
+            etc.
+
+        Args:
+            global_idx: Global sample index
+
+        Returns:
+            Tuple of (chunk_idx, sample_offset)
+        """
+        chunk_idx = global_idx // self.samples_per_chunk
+        sample_offset = global_idx % self.samples_per_chunk
+        return chunk_idx, sample_offset
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        """Get sample by global index.
+
+        With data_sharding=True (default), MegatronPretrainingRandomSampler gives
+        this rank contiguous blocks of indices. We map these to chunk/offset.
+
+        Args:
+            idx: Global sample index from the sampler
+
+        Returns:
+            Encoded sample dictionary
+        """
+        chunk_idx, sample_offset = self._global_idx_to_chunk_and_offset(idx)
+
+        # Load chunk (waits if not yet available)
+        samples = self._load_chunk(chunk_idx)
+
+        if not samples:
+            # Chunk not available - find nearest valid chunk for this rank
+            # This handles edge cases where producer hasn't written this chunk yet
+            fallback_chunk_idx = self.dp_rank
+            while fallback_chunk_idx < chunk_idx:
+                fallback_chunk_idx += self.dp_world_size
+
+            if fallback_chunk_idx != chunk_idx:
+                samples = self._load_chunk(fallback_chunk_idx)
+
+        if not samples:
+            # Still no samples - this is an error condition
+            raise IndexError(
+                f'[LazyShardedDataset] Rank {self.dp_rank}: No samples available for idx {idx} '
+                f'(chunk {chunk_idx}). Ensure producer is writing chunks.'
+            )
+
+        # Handle case where chunk has fewer samples than expected
+        actual_offset = sample_offset % len(samples)
+        return samples[actual_offset]
+
+    def evict_chunk(self, chunk_idx: int) -> None:
+        """Remove chunk from cache to free memory.
+
+        Call this after you're done with a chunk to reduce memory usage.
+
+        Args:
+            chunk_idx: The chunk index to evict
+        """
+        if chunk_idx in self._chunk_cache:
+            del self._chunk_cache[chunk_idx]
+            logger.debug(f'[LazyShardedDataset] Evicted chunk {chunk_idx} from cache')
+
+    def get_cache_stats(self) -> Dict[str, Any]:
+        """Get statistics about the chunk cache.
+
+        Returns:
+            Dictionary with cache statistics
+        """
+        return {
+            'cached_chunks': len(self._chunk_cache),
+            'cached_chunk_ids': list(self._chunk_cache.keys()),
+            'total_cached_samples': sum(len(s) for s in self._chunk_cache.values()),
+        }
