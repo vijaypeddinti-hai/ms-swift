@@ -19,10 +19,10 @@ from modelscope.utils.config_ds import MS_CACHE_HOME
 
 from swift.hub import get_hub
 from swift.utils import download_ms_file, get_logger, get_seed, safe_ddp_context, use_hf_hub
+from .dynamic import DynamicDirectoryDataset
 from .preprocessor import RowPreprocessor
 from .register import DATASET_MAPPING, DATASET_TYPE, DatasetMeta, SubsetDataset
 from .utils import sample_dataset
-from .dynamic import DynamicDirectoryDataset
 
 logger = get_logger()
 

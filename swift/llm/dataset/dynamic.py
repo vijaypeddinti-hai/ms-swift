@@ -26,12 +26,12 @@ Example:
     ...     # Will see new files as they're added
     ...     print(sample)
 """
-import json
 import random
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Literal, Optional, Union
 
+import json
 from torch.utils.data import IterableDataset
 
 from swift.utils import get_logger
@@ -76,8 +76,8 @@ class DynamicDirectoryDataset(IterableDataset):
     def __init__(
         self,
         directory: Union[str, Path],
-        file_pattern: str = "*.jsonl",
-        file_type: Literal["jsonl", "json", "parquet"] = "jsonl",
+        file_pattern: str = '*.jsonl',
+        file_type: Literal['jsonl', 'json', 'parquet'] = 'jsonl',
         shuffle: bool = True,
         shuffle_buffer_size: int = 1000,
         wait_for_files: bool = True,
@@ -115,9 +115,9 @@ class DynamicDirectoryDataset(IterableDataset):
         marker_path = self._get_completed_marker_path(data_file)
         try:
             marker_path.touch()
-            logger.debug(f"Marked as completed: {data_file.name}")
+            logger.debug(f'Marked as completed: {data_file.name}')
         except (OSError, IOError) as e:
-            logger.warning(f"Failed to create completion marker for {data_file}: {e}")
+            logger.warning(f'Failed to create completion marker for {data_file}: {e}')
 
     def _scan_directory(self) -> List[Path]:
         """Scan directory for matching files, skipping completed ones."""
@@ -148,10 +148,8 @@ class DynamicDirectoryDataset(IterableDataset):
                 return files
             if not self.wait_for_files:
                 return []
-            logger.info(
-                f"[DynamicDirectoryDataset] No files in {self.directory}, "
-                f"waiting {self.wait_poll_interval}s..."
-            )
+            logger.info(f'[DynamicDirectoryDataset] No files in {self.directory}, '
+                        f'waiting {self.wait_poll_interval}s...')
             time.sleep(self.wait_poll_interval)
 
     def _read_jsonl_file(self, path: Path) -> Iterator[Dict[str, Any]]:
@@ -165,9 +163,9 @@ class DynamicDirectoryDataset(IterableDataset):
                     try:
                         yield json.loads(line)
                     except json.JSONDecodeError as e:
-                        logger.warning(f"Skipping invalid JSON at {path}:{line_num}: {e}")
+                        logger.warning(f'Skipping invalid JSON at {path}:{line_num}: {e}')
         except Exception as e:
-            logger.warning(f"Error reading {path}: {e}")
+            logger.warning(f'Error reading {path}: {e}')
 
     def _read_json_file(self, path: Path) -> Iterator[Dict[str, Any]]:
         """Read samples from a JSON file (expects list of dicts or single dict)."""
@@ -179,9 +177,9 @@ class DynamicDirectoryDataset(IterableDataset):
             elif isinstance(data, dict):
                 yield data
             else:
-                logger.warning(f"Unexpected JSON structure in {path}")
+                logger.warning(f'Unexpected JSON structure in {path}')
         except Exception as e:
-            logger.warning(f"Error reading {path}: {e}")
+            logger.warning(f'Error reading {path}: {e}')
 
     def _read_parquet_file(self, path: Path) -> Iterator[Dict[str, Any]]:
         """Read samples from a Parquet file."""
@@ -192,23 +190,20 @@ class DynamicDirectoryDataset(IterableDataset):
                 for row in batch.to_pylist():
                     yield row
         except Exception as e:
-            logger.warning(f"Error reading {path}: {e}")
+            logger.warning(f'Error reading {path}: {e}')
 
     def _read_file(self, path: Path) -> Iterator[Dict[str, Any]]:
         """Read samples from a file based on file_type."""
-        if self.file_type == "jsonl":
+        if self.file_type == 'jsonl':
             yield from self._read_jsonl_file(path)
-        elif self.file_type == "json":
+        elif self.file_type == 'json':
             yield from self._read_json_file(path)
-        elif self.file_type == "parquet":
+        elif self.file_type == 'parquet':
             yield from self._read_parquet_file(path)
         else:
-            raise ValueError(f"Unsupported file_type: {self.file_type}")
+            raise ValueError(f'Unsupported file_type: {self.file_type}')
 
-    def _shuffle_buffer_iter(
-        self,
-        sample_iter: Iterator[Dict[str, Any]]
-    ) -> Iterator[Dict[str, Any]]:
+    def _shuffle_buffer_iter(self, sample_iter: Iterator[Dict[str, Any]]) -> Iterator[Dict[str, Any]]:
         """Apply shuffle buffer to sample iterator."""
         buffer: List[Dict[str, Any]] = []
 
@@ -235,12 +230,10 @@ class DynamicDirectoryDataset(IterableDataset):
         # Re-scan directory for files
         files = self._wait_for_files()
         if not files:
-            logger.info("[DynamicDirectoryDataset] No files found, stopping iteration")
+            logger.info('[DynamicDirectoryDataset] No files found, stopping iteration')
             return
 
-        logger.info(
-            f"[DynamicDirectoryDataset] Cycle {cycle}: Found {len(files)} files"
-        )
+        logger.info(f'[DynamicDirectoryDataset] Cycle {cycle}: Found {len(files)} files')
 
         # Shuffle file order if requested
         if self.shuffle:
@@ -261,7 +254,8 @@ class DynamicDirectoryDataset(IterableDataset):
                 # Mark file as completed after reading all samples
                 if self.mark_completed and sample_count_in_file > 0:
                     self._mark_as_completed(file_path)
-                    logger.info(f"[DynamicDirectoryDataset] Completed: {file_path.name} ({sample_count_in_file} samples)")
+                    logger.info(
+                        f'[DynamicDirectoryDataset] Completed: {file_path.name} ({sample_count_in_file} samples)')
 
         # Apply shuffle buffer if requested
         if self.shuffle:
@@ -275,16 +269,43 @@ class DynamicDirectoryDataset(IterableDataset):
             sample_count += 1
             yield sample
 
-        logger.info(
-            f"[DynamicDirectoryDataset] Cycle {cycle} complete: "
-            f"yielded {sample_count} samples from {len(files)} files"
-        )
+        logger.info(f'[DynamicDirectoryDataset] Cycle {cycle} complete: '
+                    f'yielded {sample_count} samples from {len(files)} files')
+
+
+class EncodingDynamicDataset(IterableDataset):
+    """Wrapper that applies template encoding on-the-fly for DynamicDirectoryDataset.
+
+    This bypasses HuggingFace's map() interface which isn't compatible with
+    DynamicDirectoryDataset's re-scanning behavior.
+    """
+
+    def __init__(
+        self,
+        dataset: DynamicDirectoryDataset,
+        encode_fn: Callable[[Dict[str, Any]], Dict[str, Any]],
+        strict: bool = False,
+    ):
+        self.dataset = dataset
+        self.encode_fn = encode_fn
+        self.strict = strict
+
+    def __iter__(self) -> Iterator[Dict[str, Any]]:
+        for sample in self.dataset:
+            try:
+                encoded = self.encode_fn(sample)
+                if encoded is not None:
+                    yield encoded
+            except Exception as e:
+                if self.strict:
+                    raise
+                logger.warning(f'Encoding error (skipping sample): {e}')
 
 
 def load_dynamic_directory_dataset(
     directory: Union[str, Path],
-    file_pattern: str = "*.jsonl",
-    file_type: Literal["jsonl", "json", "parquet"] = "jsonl",
+    file_pattern: str = '*.jsonl',
+    file_type: Literal['jsonl', 'json', 'parquet'] = 'jsonl',
     shuffle: bool = True,
     shuffle_buffer_size: int = 1000,
     wait_for_files: bool = True,

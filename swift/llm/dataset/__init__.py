@@ -4,6 +4,7 @@ from datasets import Dataset as HfDataset
 
 from ..utils import get_temporary_cache_files_directory
 from . import dataset
+from .dynamic import DynamicDirectoryDataset, EncodingDynamicDataset, load_dynamic_directory_dataset
 from .loader import DATASET_TYPE, DatasetSyntax, load_dataset
 from .media import MediaResource
 from .preprocessor import (AlpacaPreprocessor, AutoPreprocessor, MessagesPreprocessor, ResponsePreprocessor,
@@ -11,7 +12,6 @@ from .preprocessor import (AlpacaPreprocessor, AutoPreprocessor, MessagesPreproc
 from .register import DATASET_MAPPING, DatasetMeta, SubsetDataset, register_dataset, register_dataset_info
 from .utils import (AddLengthPreprocessor, EncodePreprocessor, IterablePackingDataset, LazyLLMDataset, PackingDataset,
                     sample_dataset)
-from .dynamic import DynamicDirectoryDataset, load_dynamic_directory_dataset
 
 datasets.fingerprint.get_temporary_cache_files_directory = get_temporary_cache_files_directory
 datasets.arrow_dataset.get_temporary_cache_files_directory = get_temporary_cache_files_directory
