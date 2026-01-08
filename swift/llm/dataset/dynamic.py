@@ -293,7 +293,10 @@ class EncodingDynamicDataset(IterableDataset):
     def __iter__(self) -> Iterator[Dict[str, Any]]:
         for sample in self.dataset:
             try:
-                encoded = self.encode_fn(sample)
+                # CRITICAL: return_length=True is required for megatron's padding_free mode
+                # Without it, the 'length' field is not added and training crashes with KeyError
+                # This matches LazyLLMDataset behavior (see dataset/utils.py line 102)
+                encoded = self.encode_fn(sample, return_length=True)
                 if encoded is not None:
                     yield encoded
             except Exception as e:
