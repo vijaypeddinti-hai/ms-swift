@@ -1,6 +1,6 @@
 # Implementation Plan: LazyShardedDataset for Megatron-SWIFT
 
-## Status: IN PROGRESS
+## Status: COMPLETE
 
 **Last Updated**: 2026-01-09
 
@@ -50,9 +50,9 @@ MegatronSft.run() [swift/megatron/train/sft.py:77]
 
 ## Implementation Checklist
 
-### COMPLETED:
+### ALL COMPLETED:
 
-- [x] **swift/llm/dataset/lazy_sharded.py** - NEW FILE CREATED
+- [x] **swift/llm/dataset/lazy_sharded.py** - NEW FILE
   - `LazyShardedDataset` class with `__len__()` and `__getitem__()`
   - Uses `get_data_parallel_info()` to get Megatron DP rank/size
   - Modulo-based chunk assignment: `chunk_idx % dp_world_size == dp_rank`
@@ -61,59 +61,23 @@ MegatronSft.run() [swift/megatron/train/sft.py:77]
   - Creates `.completed` markers for producer coordination
   - Chunk caching with `_chunk_cache`
 
-- [x] **swift/llm/argument/base_args/data_args.py** - PARTIALLY UPDATED
-  - Added `sharded_lazy: bool = False` (line 90)
-  - Added `sharded_lazy_samples_per_chunk: int = 1000` (line 91)
+- [x] **swift/llm/argument/base_args/data_args.py** - UPDATED
+  - Added `sharded_lazy: bool = False`
+  - Added `sharded_lazy_samples_per_chunk: int = 1000`
   - Added docstrings for both arguments
-  - TODO: Add validation in `__post_init__` for sharded_lazy vs streaming conflict
+  - Added validation in `__post_init__` with detailed error messages
 
-### TODO:
+- [x] **swift/llm/dataset/__init__.py** - UPDATED
+  - Exports `LazyShardedDataset`
 
-- [ ] **swift/llm/argument/base_args/data_args.py** - FINISH
-  - Add validation in `__post_init__`:
-    ```python
-    if self.sharded_lazy:
-        if self.streaming:
-            raise ValueError('sharded_lazy=True is incompatible with streaming=True')
-        if self.rescan_files:
-            raise ValueError('sharded_lazy=True is incompatible with rescan_files=True')
-    ```
+- [x] **swift/llm/train/sft.py** - UPDATED
+  - Added handling in `_post_process_datasets()` for sharded_lazy mode
+  - Creates `LazyShardedDataset` with directory path and template.encode
 
-- [ ] **swift/llm/dataset/__init__.py** - UPDATE
-  - Export `LazyShardedDataset`:
-    ```python
-    from swift.llm.dataset.lazy_sharded import LazyShardedDataset
-    ```
-
-- [ ] **swift/llm/train/sft.py** - UPDATE `_post_process_datasets()`
-  - Add handling for `sharded_lazy` BEFORE streaming checks:
-    ```python
-    # Handle sharded_lazy mode - MUST be before streaming checks
-    if getattr(args, 'sharded_lazy', False):
-        from swift.llm.dataset.lazy_sharded import LazyShardedDataset
-
-        # Get directory path from dataset argument
-        dataset_path = args.dataset[i] if isinstance(args.dataset, list) else args.dataset
-
-        dataset = LazyShardedDataset(
-            directory=dataset_path,
-            encode_fn=template.encode,
-            samples_per_chunk=getattr(args, 'sharded_lazy_samples_per_chunk', 1000),
-            max_total_samples=args.max_steps * args.per_device_train_batch_size * 100,
-            mark_completed=True,
-        )
-        datasets[i] = dataset
-        continue
-    ```
-
-- [ ] **swift/megatron/argument/megatron_base_args.py** - UPDATE `__post_init__()`
-  - Ensure streaming=False when sharded_lazy=True:
-    ```python
-    if getattr(self, 'sharded_lazy', False):
-        if self.streaming:
-            logger.warning('sharded_lazy=True is incompatible with streaming=True. Setting streaming=False.')
-            self.streaming = False
-    ```
+- [x] **swift/megatron/argument/megatron_base_args.py** - UPDATED
+  - Auto-fixes streaming=True → False when sharded_lazy=True
+  - Auto-fixes rescan_files=True → False when sharded_lazy=True
+  - Logs informative messages about the changes
 
 ---
 
@@ -122,14 +86,14 @@ MegatronSft.run() [swift/megatron/train/sft.py:77]
 | File | Status | Change |
 |------|--------|--------|
 | `swift/llm/dataset/lazy_sharded.py` | DONE | NEW - LazyShardedDataset class |
-| `swift/llm/argument/base_args/data_args.py` | PARTIAL | Add args + validation |
-| `swift/llm/dataset/__init__.py` | TODO | Export LazyShardedDataset |
-| `swift/llm/train/sft.py` | TODO | Route to LazyShardedDataset |
-| `swift/megatron/argument/megatron_base_args.py` | TODO | Handle sharded_lazy |
+| `swift/llm/argument/base_args/data_args.py` | DONE | Add args + validation |
+| `swift/llm/dataset/__init__.py` | DONE | Export LazyShardedDataset |
+| `swift/llm/train/sft.py` | DONE | Route to LazyShardedDataset |
+| `swift/megatron/argument/megatron_base_args.py` | DONE | Handle sharded_lazy |
 
 ---
 
-## Usage (After Implementation)
+## Usage
 
 ```bash
 megatron sft \
@@ -189,3 +153,13 @@ Network bandwidth for data loading: 0 (each rank reads from shared filesystem)
    ```python
    no_data_sharding: bool = False  # means data_sharding=True by default
    ```
+
+---
+
+## Testing Required
+
+1. Single-node test with 8 GPUs
+2. Verify each rank only loads its assigned chunks (check logs)
+3. Verify `.completed` markers are created
+4. Verify training progresses without rank 0 bottleneck
+5. Compare throughput with old streaming approach

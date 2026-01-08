@@ -122,6 +122,19 @@ class DataArguments:
         # rescan_files requires streaming
         if self.rescan_files:
             assert self.streaming, 'rescan_files=True requires streaming=True'
+        # sharded_lazy is incompatible with streaming/rescan_files
+        if self.sharded_lazy:
+            if self.streaming:
+                raise ValueError(
+                    'Configuration Error: sharded_lazy=True is incompatible with streaming=True.\n'
+                    'Reason: sharded_lazy uses the efficient non-streaming MegatronPretrainingRandomSampler path,\n'
+                    'while streaming uses MegatronDataLoaderDispatcher which has rank 0 bottleneck.\n'
+                    'Solution: Remove --streaming flag when using --sharded_lazy.')
+            if self.rescan_files:
+                raise ValueError(
+                    'Configuration Error: sharded_lazy=True is incompatible with rescan_files=True.\n'
+                    'Reason: Both handle dynamic file loading but via different mechanisms.\n'
+                    'Solution: Use --sharded_lazy only (it handles lazy chunk loading internally).')
         if len(self.val_dataset) > 0 or self.streaming and self.split_dataset_ratio > 0:
             self.split_dataset_ratio = 0.
             if len(self.val_dataset) > 0:
