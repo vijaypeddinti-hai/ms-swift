@@ -278,61 +278,75 @@ class LazyShardedDataset(Dataset):
         self._chunk_cache[chunk_idx] = samples
         return samples
 
-    def _global_idx_to_chunk_and_offset(self, global_idx: int) -> tuple:
-        """Map global sample index to (chunk_idx, sample_offset_in_chunk).
+    def _local_idx_to_chunk_and_offset(self, local_idx: int) -> tuple:
+        """Map LOCAL sample index to (global_chunk_idx, sample_offset_in_chunk).
 
-        Global index space:
-            Samples [0, samples_per_chunk) are in chunk 0
-            Samples [samples_per_chunk, 2*samples_per_chunk) are in chunk 1
-            etc.
+        LOCAL index interpretation (for producer-consumer sequential access):
+            - Each rank treats indices as local to its assigned chunks
+            - local_idx 0 to samples_per_chunk-1 → this rank's 1st chunk
+            - local_idx samples_per_chunk to 2*samples_per_chunk-1 → this rank's 2nd chunk
+            - etc.
+
+        This rank's chunks (modulo assignment):
+            - 1st chunk: global chunk index = dp_rank
+            - 2nd chunk: global chunk index = dp_rank + dp_world_size
+            - 3rd chunk: global chunk index = dp_rank + 2*dp_world_size
+            - etc.
+
+        Example with dp_world_size=8, dp_rank=3, samples_per_chunk=1000:
+            local_idx 0-999   → global chunk 3  (rank's 1st chunk)
+            local_idx 1000-1999 → global chunk 11 (rank's 2nd chunk)
+            local_idx 2000-2999 → global chunk 19 (rank's 3rd chunk)
 
         Args:
-            global_idx: Global sample index
+            local_idx: Local sample index for this rank
 
         Returns:
-            Tuple of (chunk_idx, sample_offset)
+            Tuple of (global_chunk_idx, sample_offset)
         """
-        chunk_idx = global_idx // self.samples_per_chunk
-        sample_offset = global_idx % self.samples_per_chunk
-        return chunk_idx, sample_offset
+        my_chunk_num = local_idx // self.samples_per_chunk  # Which of MY chunks (0, 1, 2, ...)
+        sample_offset = local_idx % self.samples_per_chunk
+
+        # Map to global chunk index: rank, rank+world_size, rank+2*world_size, ...
+        global_chunk_idx = self.dp_rank + (my_chunk_num * self.dp_world_size)
+
+        return global_chunk_idx, sample_offset
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        """Get sample by global index.
+        """Get sample by index.
 
-        With data_sharding=True (default), MegatronPretrainingRandomSampler gives
-        this rank contiguous blocks of indices. We map these to chunk/offset.
+        IMPORTANT: For producer-consumer streaming, use --train_dataloader_shuffle false
+        so that indices are sequential (0, 1, 2, ...). This ensures chunks are consumed
+        in order as they're produced.
+
+        The index is treated as LOCAL to this rank and mapped to this rank's assigned
+        chunks via modulo assignment.
 
         Args:
-            idx: Global sample index from the sampler
+            idx: Sample index (treated as local to this rank)
 
         Returns:
             Encoded sample dictionary
         """
-        chunk_idx, sample_offset = self._global_idx_to_chunk_and_offset(idx)
+        global_chunk_idx, sample_offset = self._local_idx_to_chunk_and_offset(idx)
 
         # Load chunk (waits if not yet available)
-        samples = self._load_chunk(chunk_idx)
+        samples = self._load_chunk(global_chunk_idx)
 
         if not samples:
-            # Chunk not available - find nearest valid chunk for this rank
-            # This handles edge cases where producer hasn't written this chunk yet
-            fallback_chunk_idx = self.dp_rank
-            while fallback_chunk_idx < chunk_idx:
-                fallback_chunk_idx += self.dp_world_size
-
-            if fallback_chunk_idx != chunk_idx:
-                samples = self._load_chunk(fallback_chunk_idx)
-
-        if not samples:
-            # Still no samples - this is an error condition
+            # Chunk not available yet - this shouldn't happen with sequential access
+            # and a producer that writes chunks in order
             raise IndexError(
                 f'[LazyShardedDataset] Rank {self.dp_rank}: No samples available for idx {idx} '
-                f'(chunk {chunk_idx}). Ensure producer is writing chunks.'
+                f'(mapped to global chunk {global_chunk_idx}). '
+                f'Ensure producer is writing chunks in order and use --train_dataloader_shuffle false.'
             )
 
         # Handle case where chunk has fewer samples than expected
-        actual_offset = sample_offset % len(samples)
-        return samples[actual_offset]
+        if sample_offset >= len(samples):
+            sample_offset = sample_offset % len(samples)
+
+        return samples[sample_offset]
 
     def evict_chunk(self, chunk_idx: int) -> None:
         """Remove chunk from cache to free memory.

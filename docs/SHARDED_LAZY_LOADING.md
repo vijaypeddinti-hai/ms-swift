@@ -18,8 +18,12 @@ megatron sft \
     --dataset /workspace/data/chunks \
     --sharded_lazy true \
     --sharded_lazy_samples_per_chunk 1000 \
+    --train_dataloader_shuffle false \
     --train_iters 20000
 ```
+
+**IMPORTANT:** `--train_dataloader_shuffle false` is required for producer-consumer streaming.
+This ensures chunks are consumed in order as they're produced.
 
 ---
 
@@ -77,6 +81,7 @@ Since the dataset size is unknown (chunks appear dynamically), you must specify 
 |----------|------|---------|-------------|
 | `--sharded_lazy` | bool | `false` | Enable sharded lazy loading |
 | `--sharded_lazy_samples_per_chunk` | int | `1000` | Expected samples per chunk file |
+| `--train_dataloader_shuffle` | bool | `true` | **Must be `false`** for producer-consumer streaming |
 | `--dataset` | str | - | Path to directory containing chunks |
 | `--train_iters` | int | - | Required when using sharded_lazy |
 
