@@ -101,7 +101,7 @@ megatron sft \
     --dataset /workspace/data/chunks \
     --sharded_lazy true \
     --sharded_lazy_samples_per_chunk 1000 \
-    --max_steps 20000 \
+    --train_iters 20000 \
     --packing false \
     ...
 ```

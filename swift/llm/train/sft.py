@@ -166,10 +166,10 @@ class SwiftSft(SwiftPipeline, TunerMixin):
                 dataset_path = args.dataset[i] if isinstance(args.dataset, list) and i < len(args.dataset) \
                     else args.dataset[0] if isinstance(args.dataset, list) else args.dataset
 
-                # Calculate max_total_samples based on max_steps
-                max_steps = getattr(args, 'max_steps', 10000)
-                batch_size = getattr(args, 'per_device_train_batch_size', 1)
-                max_total_samples = max_steps * batch_size * 100  # 100x buffer
+                # Calculate max_total_samples based on train_iters (Megatron) or max_steps (standard)
+                train_iters = getattr(args, 'train_iters', None) or getattr(args, 'max_steps', 10000)
+                batch_size = getattr(args, 'micro_batch_size', None) or getattr(args, 'per_device_train_batch_size', 1)
+                max_total_samples = train_iters * batch_size * 100  # 100x buffer
 
                 dataset = LazyShardedDataset(
                     directory=dataset_path,
