@@ -19,6 +19,7 @@ from modelscope.utils.config_ds import MS_CACHE_HOME
 
 from swift.hub import get_hub
 from swift.utils import download_ms_file, get_logger, get_seed, safe_ddp_context, use_hf_hub
+from .dynamic import DynamicDirectoryDataset
 from .preprocessor import RowPreprocessor
 from .register import DATASET_MAPPING, DATASET_TYPE, DatasetMeta, SubsetDataset
 from .utils import sample_dataset
@@ -192,6 +193,42 @@ class DatasetLoader:
         if len(datasets) == 1:
             return datasets[0]
         return interleave_datasets(datasets, *args, **kwargs)
+
+    @staticmethod
+    def _load_dynamic_directory(
+        directory: str,
+        *,
+        shuffle: bool = True,
+        shuffle_buffer_size: int = 1000,
+        seed: Optional[int] = None,
+        wait_for_files: bool = True,
+    ) -> DynamicDirectoryDataset:
+        """Load a dynamic directory dataset that re-scans for new files on each cycle.
+
+        This is used for streaming training scenarios where a producer process
+        continuously writes new data files while training consumes them.
+
+        Args:
+            directory: Path to the directory containing data files.
+            shuffle: Whether to shuffle files and samples.
+            shuffle_buffer_size: Size of the shuffle buffer for samples.
+            seed: Random seed for shuffling.
+            wait_for_files: If True, wait indefinitely when no files found.
+
+        Returns:
+            DynamicDirectoryDataset instance.
+        """
+        logger.info(f'Loading dynamic directory dataset from: {directory}')
+        logger.info(f'  shuffle={shuffle}, buffer_size={shuffle_buffer_size}, wait_for_files={wait_for_files}')
+        return DynamicDirectoryDataset(
+            directory=directory,
+            file_pattern='*.jsonl',
+            file_type='jsonl',
+            shuffle=shuffle,
+            shuffle_buffer_size=shuffle_buffer_size,
+            wait_for_files=wait_for_files,
+            seed=seed,
+        )
 
     @staticmethod
     def _load_dataset_path(
@@ -463,6 +500,7 @@ def load_dataset(
     load_from_cache_file: bool = True,
     shuffle: bool = False,
     streaming: bool = False,
+    rescan_files: bool = False,
     interleave_prob: Optional[List[float]] = None,
     stopping_strategy: Literal['first_exhausted', 'all_exhausted'] = 'first_exhausted',
     shuffle_buffer_size: int = 1000,
@@ -486,6 +524,9 @@ def load_dataset(
         num_proc: Proc number to use when preprocess the dataset.
         shuffle: Whether to shuffle the dataset.
         streaming: Streaming mode or not
+        rescan_files: If True and streaming=True and dataset is a directory, re-scan
+            the directory for new files on each iteration cycle. This enables streaming
+            from a directory where files are continuously added by a producer process.
         use_hf: Use hf dataset or ms dataset.
         hub_token: The token of the hub.
         strict: Raise if any row is not correct.
@@ -522,30 +563,55 @@ def load_dataset(
     for dataset in datasets:
         dataset_syntax = DatasetSyntax.parse(dataset)
         use_hf = dataset_syntax.use_hf or use_hf_default
-        # compat dataset_name
-        if dataset_syntax.dataset in DATASET_MAPPING:
-            dataset_meta = DATASET_MAPPING[dataset_syntax.dataset]
-            if dataset_syntax.use_hf is None and dataset_meta.dataset_path is not None:
-                dataset_syntax.dataset = dataset_meta.dataset_path
-                dataset_syntax.dataset_type = 'path'
-            else:
-                dataset_syntax.dataset = dataset_meta.hf_dataset_id if use_hf else dataset_meta.ms_dataset_id
+
+        # Use DynamicDirectoryDataset for streaming with file re-scanning
+        if rescan_files and streaming and os.path.isdir(dataset_syntax.dataset):
+            # Use DynamicDirectoryDataset - re-scans for new files on each cycle
+            logger.info(f'Using DynamicDirectoryDataset for: {dataset_syntax.dataset}')
+            train_dataset = DatasetLoader._load_dynamic_directory(
+                dataset_syntax.dataset,
+                shuffle=shuffle,
+                shuffle_buffer_size=shuffle_buffer_size,
+                seed=get_seed(seed),
+                wait_for_files=True,
+            )
+            # DynamicDirectoryDataset handles its own iteration, skip post_process
+            if split_dataset_ratio > 0:
+                logger.warning('split_dataset_ratio not supported with rescan_files=True, ignoring.')
+            if dataset_syntax.dataset_sample is not None:
+                logger.warning('dataset_sample not supported with rescan_files=True, ignoring.')
+            val_dataset = None
         else:
-            dataset_meta = dataset_syntax.get_dataset_meta(use_hf)
-        load_function = dataset_meta.load_function
-        train_dataset = load_function(dataset_syntax, dataset_meta, **load_kwargs, use_hf=use_hf)
-        train_dataset, val_dataset = DatasetLoader.post_process(
-            train_dataset,
-            dataset_sample=dataset_syntax.dataset_sample,
-            split_dataset_ratio=split_dataset_ratio,
-            streaming=streaming,
-            shuffle=shuffle,
-            random_state=seed,
-        )
+            # Standard loading path
+            # compat dataset_name
+            if dataset_syntax.dataset in DATASET_MAPPING:
+                dataset_meta = DATASET_MAPPING[dataset_syntax.dataset]
+                if dataset_syntax.use_hf is None and dataset_meta.dataset_path is not None:
+                    dataset_syntax.dataset = dataset_meta.dataset_path
+                    dataset_syntax.dataset_type = 'path'
+                else:
+                    dataset_syntax.dataset = dataset_meta.hf_dataset_id if use_hf else dataset_meta.ms_dataset_id
+            else:
+                dataset_meta = dataset_syntax.get_dataset_meta(use_hf)
+            load_function = dataset_meta.load_function
+            train_dataset = load_function(dataset_syntax, dataset_meta, **load_kwargs, use_hf=use_hf)
+            train_dataset, val_dataset = DatasetLoader.post_process(
+                train_dataset,
+                dataset_sample=dataset_syntax.dataset_sample,
+                split_dataset_ratio=split_dataset_ratio,
+                streaming=streaming,
+                shuffle=shuffle,
+                random_state=seed,
+            )
         if train_dataset is not None:
             train_datasets.append(train_dataset)
         if val_dataset is not None:
             val_datasets.append(val_dataset)
+
+    # Handle DynamicDirectoryDataset specially - can't be concatenated with other datasets
+    if rescan_files and len(train_datasets) == 1 and isinstance(train_datasets[0], DynamicDirectoryDataset):
+        # Return the DynamicDirectoryDataset directly
+        return train_datasets[0], None
 
     if interleave_prob is None:
         train_datasets = DatasetLoader._concat_datasets(train_datasets)

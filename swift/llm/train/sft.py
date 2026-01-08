@@ -11,8 +11,8 @@ from swift.trainers import TrainerFactory
 from swift.utils import append_to_jsonl, get_logger, get_model_parameter_info, is_master, plot_images, stat_array
 from ..argument import TrainArguments
 from ..base import SwiftPipeline
-from ..dataset import (AddLengthPreprocessor, EncodePreprocessor, IterablePackingDataset, LazyLLMDataset,
-                       PackingDataset, load_dataset)
+from ..dataset import (AddLengthPreprocessor, DynamicDirectoryDataset, EncodePreprocessor, EncodingDynamicDataset,
+                       IterablePackingDataset, LazyLLMDataset, PackingDataset, load_dataset)
 from ..dataset.loader import DatasetLoader
 from ..infer import get_cached_dataset, prepare_generation_config
 from .tuner import TunerMixin
@@ -169,12 +169,17 @@ class SwiftSft(SwiftPipeline, TunerMixin):
                     strict=args.strict,
                     load_from_cache_file=args.load_from_cache_file)
             elif args.streaming:
-                preprocessor = EncodePreprocessor(template=template)
-                dataset = preprocessor(
-                    dataset,
-                    num_proc=args.dataset_num_proc,
-                    load_from_cache_file=args.load_from_cache_file,
-                    strict=args.strict)
+                if isinstance(dataset, DynamicDirectoryDataset):
+                    # DynamicDirectoryDataset doesn't support HuggingFace map() interface
+                    # Use on-the-fly encoding wrapper instead
+                    dataset = EncodingDynamicDataset(dataset, encode_fn=template.encode, strict=args.strict)
+                else:
+                    preprocessor = EncodePreprocessor(template=template)
+                    dataset = preprocessor(
+                        dataset,
+                        num_proc=args.dataset_num_proc,
+                        load_from_cache_file=args.load_from_cache_file,
+                        strict=args.strict)
             datasets[i] = dataset
         return datasets
 
