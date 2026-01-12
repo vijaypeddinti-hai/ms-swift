@@ -17,6 +17,21 @@ class MegatronBaseArguments(MegatronArguments, BaseArguments):
         self.sequence_parallel_size = self.context_parallel_size
         if self.packing:
             self.padding_free = True
+
+        # Handle sharded_lazy: must use non-streaming path for efficient data loading
+        # This check happens BEFORE BaseArguments.__post_init__ to avoid validation error
+        if getattr(self, 'sharded_lazy', False):
+            if self.streaming:
+                logger.info(
+                    '[sharded_lazy] Detected streaming=True with sharded_lazy=True. '
+                    'Setting streaming=False to use efficient MegatronPretrainingRandomSampler path '
+                    '(avoids rank 0 data loading bottleneck).'
+                )
+                self.streaming = False
+            if getattr(self, 'rescan_files', False):
+                logger.info('[sharded_lazy] Setting rescan_files=False (sharded_lazy handles this internally).')
+                self.rescan_files = False
+
         BaseArguments.__post_init__(self)
         self.megatron_model_meta = get_megatron_model_meta(self.model_type)
         assert self.megatron_model_meta is not None, f'Model: {self.model} is not supported.'

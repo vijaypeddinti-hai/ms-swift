@@ -11,8 +11,8 @@ from swift.trainers import TrainerFactory
 from swift.utils import append_to_jsonl, get_logger, get_model_parameter_info, is_master, plot_images, stat_array
 from ..argument import TrainArguments
 from ..base import SwiftPipeline
-from ..dataset import (AddLengthPreprocessor, EncodePreprocessor, IterablePackingDataset, LazyLLMDataset,
-                       PackingDataset, load_dataset)
+from ..dataset import (AddLengthPreprocessor, DynamicDirectoryDataset, EncodePreprocessor, EncodingDynamicDataset,
+                       IterablePackingDataset, LazyLLMDataset, PackingDataset, load_dataset)
 from ..dataset.loader import DatasetLoader
 from ..infer import get_cached_dataset, prepare_generation_config
 from .tuner import TunerMixin
@@ -156,6 +156,31 @@ class SwiftSft(SwiftPipeline, TunerMixin):
             if i == 1 and predict_with_generate:
                 # val_dataset
                 continue
+
+            # Handle sharded_lazy mode - bypasses normal dataset processing
+            # Uses efficient MegatronPretrainingRandomSampler path (no rank 0 bottleneck)
+            if getattr(args, 'sharded_lazy', False):
+                from swift.llm.dataset.lazy_sharded import LazyShardedDataset
+
+                # Get directory path from dataset argument
+                dataset_path = args.dataset[i] if isinstance(args.dataset, list) and i < len(args.dataset) \
+                    else args.dataset[0] if isinstance(args.dataset, list) else args.dataset
+
+                # Calculate max_total_samples based on train_iters (Megatron) or max_steps (standard)
+                train_iters = getattr(args, 'train_iters', None) or getattr(args, 'max_steps', 10000)
+                batch_size = getattr(args, 'micro_batch_size', None) or getattr(args, 'per_device_train_batch_size', 1)
+                max_total_samples = train_iters * batch_size * 100  # 100x buffer
+
+                dataset = LazyShardedDataset(
+                    directory=dataset_path,
+                    encode_fn=template.encode,
+                    samples_per_chunk=getattr(args, 'sharded_lazy_samples_per_chunk', 1000),
+                    max_total_samples=max_total_samples,
+                    mark_completed=True,
+                )
+                datasets[i] = dataset
+                continue
+
             if not args.streaming and args.truncation_strategy != 'split':
                 dataset = LazyLLMDataset(dataset, template.encode, strict=args.strict, random_state=args.data_seed)
             if args.packing:
@@ -169,12 +194,17 @@ class SwiftSft(SwiftPipeline, TunerMixin):
                     strict=args.strict,
                     load_from_cache_file=args.load_from_cache_file)
             elif args.streaming:
-                preprocessor = EncodePreprocessor(template=template)
-                dataset = preprocessor(
-                    dataset,
-                    num_proc=args.dataset_num_proc,
-                    load_from_cache_file=args.load_from_cache_file,
-                    strict=args.strict)
+                if isinstance(dataset, DynamicDirectoryDataset):
+                    # DynamicDirectoryDataset doesn't support HuggingFace map() interface
+                    # Use on-the-fly encoding wrapper instead
+                    dataset = EncodingDynamicDataset(dataset, encode_fn=template.encode, strict=args.strict)
+                else:
+                    preprocessor = EncodePreprocessor(template=template)
+                    dataset = preprocessor(
+                        dataset,
+                        num_proc=args.dataset_num_proc,
+                        load_from_cache_file=args.load_from_cache_file,
+                        strict=args.strict)
             datasets[i] = dataset
         return datasets
 

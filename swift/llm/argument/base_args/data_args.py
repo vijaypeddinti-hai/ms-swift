@@ -47,6 +47,16 @@ class DataArguments:
         streaming (bool): Enables streaming to read and process the dataset on-the-fly. `--max_steps` must be set as the
             dataset length is unknown. This allows preprocessing to overlap with training but can become a bottleneck
             with a large `world_size` as preprocessing only runs on rank 0. Defaults to False.
+        rescan_files (bool): Re-scan the directory for new files on each iteration cycle. Enables
+            streaming from a directory where files are continuously added by a producer process.
+            Implies streaming=True. Defaults to False.
+        sharded_lazy (bool): Use LazyShardedDataset for distributed chunk loading without rank 0 bottleneck.
+            Each DP rank loads only chunks where chunk_idx % dp_world_size == dp_rank.
+            Requires sequential chunk naming: chunk_00000.jsonl, chunk_00001.jsonl, ...
+            Incompatible with streaming=True. Uses efficient MegatronPretrainingRandomSampler path.
+            Defaults to False.
+        sharded_lazy_samples_per_chunk (int): Expected number of samples per chunk file when using
+            sharded_lazy=True. Used to map global indices to chunk files. Defaults to 1000.
         interleave_prob (Optional[List[float]]): If set, combines datasets using `interleave_datasets` with the
             provided probabilities instead of `concatenate_datasets`. Typically used for streaming. Defaults to None.
         stopping_strategy (str): The stopping strategy for `interleave_datasets`. Can be "first_exhausted" or
@@ -83,6 +93,9 @@ class DataArguments:
     dataset_shuffle: bool = True
     val_dataset_shuffle: bool = False
     streaming: bool = False
+    rescan_files: bool = False
+    sharded_lazy: bool = False
+    sharded_lazy_samples_per_chunk: int = 1000
     interleave_prob: Optional[List[float]] = None
     stopping_strategy: Literal['first_exhausted', 'all_exhausted'] = 'first_exhausted'
     shuffle_buffer_size: int = 1000
@@ -106,6 +119,22 @@ class DataArguments:
 
     def __post_init__(self):
         self.columns = json_parse_to_dict(self.columns)
+        # rescan_files requires streaming
+        if self.rescan_files:
+            assert self.streaming, 'rescan_files=True requires streaming=True'
+        # sharded_lazy is incompatible with streaming/rescan_files
+        if self.sharded_lazy:
+            if self.streaming:
+                raise ValueError(
+                    'Configuration Error: sharded_lazy=True is incompatible with streaming=True.\n'
+                    'Reason: sharded_lazy uses the efficient non-streaming MegatronPretrainingRandomSampler path,\n'
+                    'while streaming uses MegatronDataLoaderDispatcher which has rank 0 bottleneck.\n'
+                    'Solution: Remove --streaming flag when using --sharded_lazy.')
+            if self.rescan_files:
+                raise ValueError(
+                    'Configuration Error: sharded_lazy=True is incompatible with rescan_files=True.\n'
+                    'Reason: Both handle dynamic file loading but via different mechanisms.\n'
+                    'Solution: Use --sharded_lazy only (it handles lazy chunk loading internally).')
         if len(self.val_dataset) > 0 or self.streaming and self.split_dataset_ratio > 0:
             self.split_dataset_ratio = 0.
             if len(self.val_dataset) > 0:
@@ -128,6 +157,7 @@ class DataArguments:
             'num_proc': self.dataset_num_proc,
             'load_from_cache_file': self.load_from_cache_file,
             'streaming': self.streaming,
+            'rescan_files': self.rescan_files,
             'interleave_prob': self.interleave_prob,
             'stopping_strategy': self.stopping_strategy,
             'shuffle_buffer_size': self.shuffle_buffer_size,
