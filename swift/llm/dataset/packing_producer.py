@@ -1,15 +1,36 @@
 """
 Packing Producer for Megatron-SWIFT distributed training.
 
-Pre-packs samples into fixed-length packs BEFORE training, enabling:
-1. Optimal bin-packing with full visibility of samples
-2. Consistent pack sizes (no OOM from variable lengths)
-3. Compatibility with LazyShardedDataset for streaming consumption
+Why Pre-Packing Instead of Runtime Packing?
+-------------------------------------------
+For Megatron-SWIFT + LazyShardedDataset pipelines, runtime packing (--packing true)
+is insufficient due to two hard constraints:
 
-The producer:
+1. Runtime packing needs token lengths, but lazy pipelines delay tokenization.
+   - Bin-packing requires a length signal to work.
+   - With lazy_tokenize / multimodal processors, length is unknown until full
+     preprocessing completes.
+   - This forces either: tokenizing ahead (negates "lazy"), buffering many samples
+     (RAM + latency), or accepting poor packing efficiency.
+
+2. At scale, runtime packing shifts the bottleneck from GPU to CPU/input.
+   - Packing on every rank replicates expensive CPU work N times.
+   - Packing centrally creates a rank 0 / input pipeline bottleneck.
+   - Either way, training becomes input-bound, especially for multimodal/audio
+     where preprocessing is materially more expensive than text tokenization.
+
+What Pre-Packing Provides:
+- Amortized preprocessing: tokenize once offline; training stays compute-bound
+- Preserved laziness: training reads packed objects, no lookahead/buffering needed
+- Stable cardinality: known pack count enables well-defined max_steps / resume
+- Sharding balance: constant-volume packs reduce stragglers across DP ranks
+- Multimodal OOM control: enforce overlength policy with exact preprocessing
+- Determinism: pack composition is fixed and inspectable for debugging/compliance
+
+The Producer Pipeline:
 1. Reads raw samples from input files
 2. Tokenizes using the model's template
-3. Bin-packs samples into packs of `packing_length` tokens
+3. Bin-packs samples into packs of `packing_length` tokens (first-fit decreasing)
 4. Writes pre-packed chunks for LazyShardedDataset consumption
 
 Pre-packed format (each line in chunk):

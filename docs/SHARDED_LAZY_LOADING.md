@@ -31,13 +31,30 @@ This ensures chunks are consumed in order as they're produced.
 
 For data with high length variance (e.g., audio ranging from 0.5s to 5min), use **pre-packed chunks** to avoid OOM and improve GPU utilization.
 
-### Why Pre-Pack?
+### Why Pre-Pack Instead of Runtime Packing?
 
-| Problem | Without Packing | With Pre-Packing |
-|---------|-----------------|------------------|
-| Variable lengths | OOM risk, poor utilization | Fixed pack sizes, optimal utilization |
-| Bin-packing quality | N/A | Optimal (producer sees all samples) |
-| Training complexity | Must handle variable batches | Simple fixed-size packs |
+For Megatron-SWIFT + LazyShardedDataset pipelines, runtime packing (`--packing true`) is insufficient due to two hard constraints:
+
+**1. Runtime packing needs token lengths, but lazy pipelines delay tokenization.**
+- Bin-packing requires a length signal to work
+- With `lazy_tokenize` / multimodal processors, length is unknown until full preprocessing
+- Forces either: tokenizing ahead (negates "lazy"), buffering many samples (RAM + latency), or poor packing efficiency
+
+**2. At scale, runtime packing shifts the bottleneck from GPU to CPU/input.**
+- Packing on every rank replicates expensive CPU work N times
+- Packing centrally creates a rank 0 / input pipeline bottleneck
+- Either way, training becomes input-bound, especially for multimodal/audio
+
+**What Pre-Packing Provides:**
+
+| Benefit | Description |
+|---------|-------------|
+| Amortized preprocessing | Tokenize once offline; training stays compute-bound |
+| Preserved laziness | Training reads packed objects, no lookahead needed |
+| Stable cardinality | Known pack count enables well-defined `max_steps` / resume |
+| Sharding balance | Constant-volume packs reduce stragglers across DP ranks |
+| Multimodal OOM control | Enforce overlength policy with exact preprocessing |
+| Determinism | Pack composition is fixed and inspectable |
 
 ### Quick Start with Pre-Packing
 
