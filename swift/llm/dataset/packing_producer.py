@@ -245,13 +245,17 @@ class PackingProducer:
             load_model=False,  # Don't load model weights, just tokenizer
         )
 
+        # Map 'delete' to 'raise' for template - we'll catch MaxLengthError ourselves
+        # Template only accepts: 'raise', 'left', 'right', 'split'
+        template_truncation = 'raise' if self.truncation_strategy == 'delete' else self.truncation_strategy
+
         # Get template
         self.template = get_template(
             template_type or self.model.model_meta.template,
             self.tokenizer,
             default_system=None,
             max_length=self.packing_length,
-            truncation_strategy=self.truncation_strategy,
+            truncation_strategy=template_truncation,
         )
         self.template.set_mode('train')
 
@@ -266,6 +270,8 @@ class PackingProducer:
         Returns:
             EncodedSample or None if encoding fails/sample too long
         """
+        from swift.llm.template.base import MaxLengthError
+
         try:
             encoded = self.template.encode(raw_sample, return_length=True)
 
@@ -278,7 +284,7 @@ class PackingProducer:
 
             length = encoded.get('length', len(encoded.get('input_ids', [])))
 
-            # Handle overlong samples
+            # Handle overlong samples (shouldn't happen with left/right truncation)
             if length > self.packing_length:
                 if self.truncation_strategy == 'delete':
                     self.stats.samples_dropped_too_long += 1
@@ -292,6 +298,10 @@ class PackingProducer:
                 raw_sample=raw_sample,
             )
 
+        except MaxLengthError:
+            # Sample exceeded max_length with truncation_strategy='delete' (mapped to 'raise')
+            self.stats.samples_dropped_too_long += 1
+            return None
         except Exception as e:
             logger.warning(f"[PackingProducer] Encoding error: {e}")
             self.stats.samples_dropped_encode_error += 1
