@@ -27,6 +27,75 @@ This ensures chunks are consumed in order as they're produced.
 
 ---
 
+## Pre-Packed Format (Recommended for Variable-Length Data)
+
+For data with high length variance (e.g., audio ranging from 0.5s to 5min), use **pre-packed chunks** to avoid OOM and improve GPU utilization.
+
+### Why Pre-Pack?
+
+| Problem | Without Packing | With Pre-Packing |
+|---------|-----------------|------------------|
+| Variable lengths | OOM risk, poor utilization | Fixed pack sizes, optimal utilization |
+| Bin-packing quality | N/A | Optimal (producer sees all samples) |
+| Training complexity | Must handle variable batches | Simple fixed-size packs |
+
+### Quick Start with Pre-Packing
+
+**Step 1: Pre-pack raw samples**
+
+```bash
+python -m swift.llm.dataset.packing_producer \
+    --model /path/to/model \
+    --input /data/raw_samples/*.jsonl \
+    --output /data/packed_chunks \
+    --packing_length 8192 \
+    --samples_per_chunk 100
+```
+
+**Step 2: Train with pre-packed chunks**
+
+```bash
+megatron sft \
+    --model /path/to/model \
+    --dataset /data/packed_chunks \
+    --sharded_lazy true \
+    --sharded_lazy_pre_packed true \
+    --sharded_lazy_samples_per_chunk 100 \
+    --packing false \
+    --train_iters 20000
+```
+
+Note: `--packing false` because data is ALREADY packed by the producer.
+
+### Pre-Packed Chunk Format
+
+Each line in a pre-packed chunk contains:
+
+```json
+{
+    "input_ids": [1, 2, 3, ..., 100, 200, 201, ...],
+    "labels": [-100, -100, 3, ..., -100, 200, 201, ...],
+    "position_ids": [0, 1, 2, ..., 0, 1, 2, ...],
+    "lengths": [50, 60, 45],
+    "pack_length": 155,
+    "num_samples": 3
+}
+```
+
+- `input_ids`: Concatenated tokens from multiple samples
+- `labels`: Concatenated labels (-100 for non-loss positions)
+- `position_ids`: Reset to 0 at each sample boundary (enables cu_seqlens derivation)
+- `lengths`: Individual sample lengths in this pack
+- `pack_length`: Total tokens in the pack
+
+### Additional Arguments for Pre-Packing
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `--sharded_lazy_pre_packed` | bool | `false` | Chunks are pre-packed (skip encoding) |
+
+---
+
 ## Requirements
 
 ### 1. Chunk File Naming

@@ -171,12 +171,16 @@ class SwiftSft(SwiftPipeline, TunerMixin):
                 batch_size = getattr(args, 'micro_batch_size', None) or getattr(args, 'per_device_train_batch_size', 1)
                 max_total_samples = train_iters * batch_size * 100  # 100x buffer
 
+                # Check if using pre-packed format (from PackingProducer)
+                pre_packed = getattr(args, 'sharded_lazy_pre_packed', False)
+
                 dataset = LazyShardedDataset(
                     directory=dataset_path,
-                    encode_fn=template.encode,
+                    encode_fn=None if pre_packed else template.encode,
                     samples_per_chunk=getattr(args, 'sharded_lazy_samples_per_chunk', 1000),
                     max_total_samples=max_total_samples,
                     mark_completed=True,
+                    pre_packed=pre_packed,
                 )
                 datasets[i] = dataset
                 continue

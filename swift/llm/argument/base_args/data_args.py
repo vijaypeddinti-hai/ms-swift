@@ -57,6 +57,9 @@ class DataArguments:
             Defaults to False.
         sharded_lazy_samples_per_chunk (int): Expected number of samples per chunk file when using
             sharded_lazy=True. Used to map global indices to chunk files. Defaults to 1000.
+        sharded_lazy_pre_packed (bool): If True, chunks contain pre-packed samples from PackingProducer
+            that are already tokenized and packed. No encoding is needed during training.
+            Use this for optimal packing with dynamic/streaming data. Defaults to False.
         interleave_prob (Optional[List[float]]): If set, combines datasets using `interleave_datasets` with the
             provided probabilities instead of `concatenate_datasets`. Typically used for streaming. Defaults to None.
         stopping_strategy (str): The stopping strategy for `interleave_datasets`. Can be "first_exhausted" or
@@ -96,6 +99,7 @@ class DataArguments:
     rescan_files: bool = False
     sharded_lazy: bool = False
     sharded_lazy_samples_per_chunk: int = 1000
+    sharded_lazy_pre_packed: bool = False
     interleave_prob: Optional[List[float]] = None
     stopping_strategy: Literal['first_exhausted', 'all_exhausted'] = 'first_exhausted'
     shuffle_buffer_size: int = 1000

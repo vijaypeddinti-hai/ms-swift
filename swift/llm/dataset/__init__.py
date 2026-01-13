@@ -6,6 +6,7 @@ from ..utils import get_temporary_cache_files_directory
 from . import dataset
 from .dynamic import DynamicDirectoryDataset, EncodingDynamicDataset, load_dynamic_directory_dataset
 from .lazy_sharded import LazyShardedDataset
+from .packing_producer import BinPacker, EncodedSample, PackingProducer, PackingStats
 from .loader import DATASET_TYPE, DatasetSyntax, load_dataset
 from .media import MediaResource
 from .preprocessor import (AlpacaPreprocessor, AutoPreprocessor, MessagesPreprocessor, ResponsePreprocessor,

@@ -10,12 +10,38 @@ instead of the bottlenecked streaming path (MegatronDataLoaderDispatcher).
 Key insight: With data_sharding=True (default), each DP rank gets contiguous
 blocks of indices, which aligns with modulo-based chunk assignment.
 
+Supports two chunk formats:
+
+1. RAW FORMAT (requires encode_fn):
+   Each line is a raw sample that needs encoding:
+   {"messages": [{"role": "user", "content": "..."}], ...}
+
+2. PRE-PACKED FORMAT (pre_packed=True):
+   Each line is already tokenized and packed by PackingProducer:
+   {
+       "input_ids": [...],
+       "labels": [...],
+       "position_ids": [...],
+       "lengths": [L1, L2, ...],
+       "pack_length": N
+   }
+
 Usage:
+    # Raw format (default)
     megatron sft \
         --model /path/to/model \
         --dataset /workspace/data/chunks \
         --sharded_lazy true \
         --sharded_lazy_samples_per_chunk 1000 \
+        --max_steps 20000
+
+    # Pre-packed format
+    megatron sft \
+        --model /path/to/model \
+        --dataset /workspace/data/packed_chunks \
+        --sharded_lazy true \
+        --sharded_lazy_pre_packed true \
+        --sharded_lazy_samples_per_chunk 100 \
         --max_steps 20000
 
 Producer must write chunks with sequential naming:
@@ -81,7 +107,7 @@ class LazyShardedDataset(Dataset):
 
     Args:
         directory: Path to directory containing chunk files (chunk_00000.jsonl, etc.)
-        encode_fn: Function to encode samples (typically template.encode)
+        encode_fn: Function to encode samples (typically template.encode). Required unless pre_packed=True.
         samples_per_chunk: Expected samples per chunk file
         max_total_samples: Upper bound for __len__() - training stops via max_steps
         wait_poll_interval: Seconds between polls when waiting for chunks
@@ -90,12 +116,14 @@ class LazyShardedDataset(Dataset):
         chunk_pattern: Regex to extract chunk index from filename
         dp_rank: Override data parallel rank (default: auto-detect)
         dp_world_size: Override data parallel world size (default: auto-detect)
+        pre_packed: If True, chunks contain pre-packed samples (from PackingProducer)
+                   that don't need encoding. Default: False.
     """
 
     def __init__(
         self,
         directory: Union[str, Path],
-        encode_fn: Callable[[Dict[str, Any], bool], Optional[Dict[str, Any]]],
+        encode_fn: Optional[Callable[[Dict[str, Any], bool], Optional[Dict[str, Any]]]] = None,
         samples_per_chunk: int = 1000,
         max_total_samples: int = 100_000_000,
         wait_poll_interval: float = 5.0,
@@ -104,9 +132,15 @@ class LazyShardedDataset(Dataset):
         chunk_pattern: str = r'chunk_(\d+)\.jsonl',
         dp_rank: Optional[int] = None,
         dp_world_size: Optional[int] = None,
+        pre_packed: bool = False,
     ):
         self.directory = Path(directory)
         self.encode_fn = encode_fn
+        self.pre_packed = pre_packed
+
+        # Validate: need encode_fn unless pre_packed
+        if not pre_packed and encode_fn is None:
+            raise ValueError("encode_fn is required when pre_packed=False")
         self.samples_per_chunk = samples_per_chunk
         self.max_total_samples = max_total_samples
         self.wait_poll_interval = wait_poll_interval
@@ -129,7 +163,8 @@ class LazyShardedDataset(Dataset):
 
         logger.info(
             f'[LazyShardedDataset] Initialized: dp_rank={self.dp_rank}/{self.dp_world_size}, '
-            f'directory={self.directory}, samples_per_chunk={samples_per_chunk}'
+            f'directory={self.directory}, samples_per_chunk={samples_per_chunk}, '
+            f'pre_packed={pre_packed}'
         )
 
     def __len__(self) -> int:
@@ -227,7 +262,7 @@ class LazyShardedDataset(Dataset):
         if chunk_path is None:
             return []
 
-        # Load and encode samples
+        # Load samples (and encode if not pre-packed)
         samples = []
         errors = 0
         try:
@@ -238,10 +273,19 @@ class LazyShardedDataset(Dataset):
                         continue
                     try:
                         raw = json.loads(line)
-                        # CRITICAL: return_length=True for Megatron's padding_free mode
-                        encoded = self.encode_fn(raw, return_length=True)
-                        if encoded is not None:
-                            samples.append(encoded)
+
+                        if self.pre_packed:
+                            # Pre-packed format: use directly, add length field if missing
+                            if 'length' not in raw and 'pack_length' in raw:
+                                raw['length'] = raw['pack_length']
+                            samples.append(raw)
+                        else:
+                            # Raw format: encode using template
+                            # CRITICAL: return_length=True for Megatron's padding_free mode
+                            encoded = self.encode_fn(raw, return_length=True)
+                            if encoded is not None:
+                                samples.append(encoded)
+
                     except json.JSONDecodeError as e:
                         errors += 1
                         if errors <= 3:
