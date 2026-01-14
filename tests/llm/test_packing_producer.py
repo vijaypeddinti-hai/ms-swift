@@ -455,5 +455,653 @@ class TestEdgeCases:
         assert total_samples == 2
 
 
+# ============================================================================
+# LazyShardedDataset tests (standalone implementation for testing)
+# ============================================================================
+
+import re
+import threading
+import time
+from typing import Callable
+
+
+class MockLazyShardedDataset:
+    """Standalone mock of LazyShardedDataset for testing without swift dependencies.
+
+    This mirrors the core logic of the real LazyShardedDataset.
+    """
+
+    def __init__(
+        self,
+        directory: str,
+        encode_fn: Callable = None,
+        samples_per_chunk: int = 1000,
+        dp_rank: int = 0,
+        dp_world_size: int = 1,
+        pre_packed: bool = False,
+        max_wait_time: float = 1.0,
+        wait_poll_interval: float = 0.1,
+        mark_completed: bool = True,
+    ):
+        self.directory = Path(directory)
+        self.encode_fn = encode_fn
+        self.samples_per_chunk = samples_per_chunk
+        self.dp_rank = dp_rank
+        self.dp_world_size = dp_world_size
+        self.pre_packed = pre_packed
+        self.max_wait_time = max_wait_time
+        self.wait_poll_interval = wait_poll_interval
+        self.mark_completed = mark_completed
+        self.chunk_pattern = re.compile(r'chunk_(\d+)\.jsonl')
+
+        self._chunk_cache: Dict[int, List[Dict[str, Any]]] = {}
+
+        if not pre_packed and encode_fn is None:
+            raise ValueError("encode_fn is required when pre_packed=False")
+
+    def _is_my_chunk(self, chunk_idx: int) -> bool:
+        return chunk_idx % self.dp_world_size == self.dp_rank
+
+    def _chunk_path(self, chunk_idx: int) -> Path:
+        return self.directory / f'chunk_{chunk_idx:05d}.jsonl'
+
+    def _completed_marker_path(self, chunk_path: Path) -> Path:
+        return chunk_path.with_suffix(chunk_path.suffix + '.completed')
+
+    def _wait_for_chunk(self, chunk_idx: int) -> Optional[Path]:
+        chunk_path = self._chunk_path(chunk_idx)
+        start_time = time.time()
+
+        while True:
+            if chunk_path.exists():
+                return chunk_path
+
+            elapsed = time.time() - start_time
+            if self.max_wait_time > 0 and elapsed > self.max_wait_time:
+                return None
+
+            time.sleep(self.wait_poll_interval)
+
+    def _load_chunk(self, chunk_idx: int) -> List[Dict[str, Any]]:
+        if chunk_idx in self._chunk_cache:
+            return self._chunk_cache[chunk_idx]
+
+        if not self._is_my_chunk(chunk_idx):
+            return []
+
+        chunk_path = self._wait_for_chunk(chunk_idx)
+        if chunk_path is None:
+            return []
+
+        samples = []
+        with open(chunk_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    raw = json.loads(line)
+                except json.JSONDecodeError:
+                    continue  # Skip corrupt lines
+
+                if self.pre_packed:
+                    if 'length' not in raw and 'pack_length' in raw:
+                        raw['length'] = raw['pack_length']
+                    samples.append(raw)
+                else:
+                    encoded = self.encode_fn(raw)
+                    if encoded is not None:
+                        samples.append(encoded)
+
+        if self.mark_completed and samples:
+            self._completed_marker_path(chunk_path).touch()
+
+        self._chunk_cache[chunk_idx] = samples
+        return samples
+
+    def _local_idx_to_chunk_and_offset(self, local_idx: int) -> tuple:
+        my_chunk_num = local_idx // self.samples_per_chunk
+        sample_offset = local_idx % self.samples_per_chunk
+        global_chunk_idx = self.dp_rank + (my_chunk_num * self.dp_world_size)
+        return global_chunk_idx, sample_offset
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        global_chunk_idx, sample_offset = self._local_idx_to_chunk_and_offset(idx)
+        samples = self._load_chunk(global_chunk_idx)
+
+        if not samples:
+            raise IndexError(f'No samples for idx {idx} (chunk {global_chunk_idx})')
+
+        if sample_offset >= len(samples):
+            sample_offset = sample_offset % len(samples)
+
+        return samples[sample_offset]
+
+    def __len__(self) -> int:
+        return 100_000_000  # Large number, training stops via max_steps
+
+
+class TestLazyShardedDatasetChunkAssignment:
+    """Tests for chunk assignment logic (modulo distribution)."""
+
+    def test_single_rank(self):
+        """Single rank should get all chunks."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dataset = MockLazyShardedDataset(
+                directory=tmpdir,
+                encode_fn=lambda x: x,
+                dp_rank=0,
+                dp_world_size=1,
+            )
+
+            # All chunks belong to rank 0
+            assert dataset._is_my_chunk(0) == True
+            assert dataset._is_my_chunk(1) == True
+            assert dataset._is_my_chunk(100) == True
+
+    def test_two_ranks(self):
+        """Two ranks should split chunks evenly."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dataset_rank0 = MockLazyShardedDataset(
+                directory=tmpdir,
+                encode_fn=lambda x: x,
+                dp_rank=0,
+                dp_world_size=2,
+            )
+            dataset_rank1 = MockLazyShardedDataset(
+                directory=tmpdir,
+                encode_fn=lambda x: x,
+                dp_rank=1,
+                dp_world_size=2,
+            )
+
+            # Rank 0 gets even chunks
+            assert dataset_rank0._is_my_chunk(0) == True
+            assert dataset_rank0._is_my_chunk(1) == False
+            assert dataset_rank0._is_my_chunk(2) == True
+            assert dataset_rank0._is_my_chunk(3) == False
+
+            # Rank 1 gets odd chunks
+            assert dataset_rank1._is_my_chunk(0) == False
+            assert dataset_rank1._is_my_chunk(1) == True
+            assert dataset_rank1._is_my_chunk(2) == False
+            assert dataset_rank1._is_my_chunk(3) == True
+
+    def test_eight_ranks(self):
+        """Eight ranks should distribute chunks correctly."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for rank in range(8):
+                dataset = MockLazyShardedDataset(
+                    directory=tmpdir,
+                    encode_fn=lambda x: x,
+                    dp_rank=rank,
+                    dp_world_size=8,
+                )
+
+                # Each rank gets chunks where chunk_idx % 8 == rank
+                for chunk_idx in range(24):
+                    expected = (chunk_idx % 8 == rank)
+                    assert dataset._is_my_chunk(chunk_idx) == expected, \
+                        f"Rank {rank}, chunk {chunk_idx}: expected {expected}"
+
+
+class TestLazyShardedDatasetIndexMapping:
+    """Tests for local index to chunk mapping."""
+
+    def test_local_idx_single_rank(self):
+        """Local index mapping for single rank."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dataset = MockLazyShardedDataset(
+                directory=tmpdir,
+                encode_fn=lambda x: x,
+                samples_per_chunk=100,
+                dp_rank=0,
+                dp_world_size=1,
+            )
+
+            # idx 0-99 -> chunk 0
+            assert dataset._local_idx_to_chunk_and_offset(0) == (0, 0)
+            assert dataset._local_idx_to_chunk_and_offset(50) == (0, 50)
+            assert dataset._local_idx_to_chunk_and_offset(99) == (0, 99)
+
+            # idx 100-199 -> chunk 1
+            assert dataset._local_idx_to_chunk_and_offset(100) == (1, 0)
+            assert dataset._local_idx_to_chunk_and_offset(150) == (1, 50)
+
+    def test_local_idx_multi_rank(self):
+        """Local index mapping for multiple ranks."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Rank 3 of 8
+            dataset = MockLazyShardedDataset(
+                directory=tmpdir,
+                encode_fn=lambda x: x,
+                samples_per_chunk=1000,
+                dp_rank=3,
+                dp_world_size=8,
+            )
+
+            # idx 0-999 -> rank's 1st chunk = global chunk 3
+            assert dataset._local_idx_to_chunk_and_offset(0) == (3, 0)
+            assert dataset._local_idx_to_chunk_and_offset(500) == (3, 500)
+
+            # idx 1000-1999 -> rank's 2nd chunk = global chunk 11 (3 + 8)
+            assert dataset._local_idx_to_chunk_and_offset(1000) == (11, 0)
+            assert dataset._local_idx_to_chunk_and_offset(1500) == (11, 500)
+
+            # idx 2000-2999 -> rank's 3rd chunk = global chunk 19 (3 + 16)
+            assert dataset._local_idx_to_chunk_and_offset(2000) == (19, 0)
+
+
+class TestLazyShardedDatasetPrePacked:
+    """Tests for pre-packed chunk loading."""
+
+    def test_load_prepacked_chunk(self):
+        """Load pre-packed chunk directly."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Write pre-packed chunk
+            chunk_path = Path(tmpdir) / "chunk_00000.jsonl"
+            packs = [
+                {
+                    "input_ids": [1, 2, 3, 4, 5],
+                    "labels": [-100, 2, 3, 4, 5],
+                    "position_ids": [0, 1, 2, 0, 1],
+                    "lengths": [3, 2],
+                    "pack_length": 5,
+                    "num_samples": 2,
+                },
+                {
+                    "input_ids": [10, 20, 30],
+                    "labels": [10, 20, 30],
+                    "position_ids": [0, 1, 2],
+                    "lengths": [3],
+                    "pack_length": 3,
+                    "num_samples": 1,
+                },
+            ]
+            with open(chunk_path, 'w') as f:
+                for pack in packs:
+                    f.write(json.dumps(pack) + '\n')
+
+            dataset = MockLazyShardedDataset(
+                directory=tmpdir,
+                samples_per_chunk=2,
+                pre_packed=True,
+                dp_rank=0,
+                dp_world_size=1,
+            )
+
+            # Access samples
+            sample0 = dataset[0]
+            assert sample0['input_ids'] == [1, 2, 3, 4, 5]
+            assert sample0['length'] == 5  # Added from pack_length
+
+            sample1 = dataset[1]
+            assert sample1['input_ids'] == [10, 20, 30]
+
+    def test_prepacked_adds_length_field(self):
+        """Pre-packed should add length from pack_length if missing."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            chunk_path = Path(tmpdir) / "chunk_00000.jsonl"
+            pack = {
+                "input_ids": [1, 2, 3],
+                "labels": [1, 2, 3],
+                "pack_length": 3,
+                # No 'length' field
+            }
+            with open(chunk_path, 'w') as f:
+                f.write(json.dumps(pack) + '\n')
+
+            dataset = MockLazyShardedDataset(
+                directory=tmpdir,
+                samples_per_chunk=1,
+                pre_packed=True,
+                dp_rank=0,
+                dp_world_size=1,
+            )
+
+            sample = dataset[0]
+            assert sample['length'] == 3  # Should be added
+
+
+class TestLazyShardedDatasetRawFormat:
+    """Tests for raw format chunk loading with encoding."""
+
+    def test_load_raw_chunk_with_encode(self):
+        """Load raw chunk and encode samples."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            chunk_path = Path(tmpdir) / "chunk_00000.jsonl"
+            raw_samples = [
+                {"messages": [{"role": "user", "content": "hello"}]},
+                {"messages": [{"role": "user", "content": "world"}]},
+            ]
+            with open(chunk_path, 'w') as f:
+                for sample in raw_samples:
+                    f.write(json.dumps(sample) + '\n')
+
+            # Mock encode function
+            def mock_encode(sample):
+                content = sample['messages'][0]['content']
+                tokens = [ord(c) for c in content]
+                return {
+                    'input_ids': tokens,
+                    'labels': tokens,
+                    'length': len(tokens),
+                }
+
+            dataset = MockLazyShardedDataset(
+                directory=tmpdir,
+                encode_fn=mock_encode,
+                samples_per_chunk=2,
+                pre_packed=False,
+                dp_rank=0,
+                dp_world_size=1,
+            )
+
+            sample0 = dataset[0]
+            assert sample0['input_ids'] == [ord(c) for c in "hello"]
+            assert sample0['length'] == 5
+
+            sample1 = dataset[1]
+            assert sample1['input_ids'] == [ord(c) for c in "world"]
+
+    def test_encode_fn_required_when_not_prepacked(self):
+        """Should raise error if encode_fn missing for raw format."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with pytest.raises(ValueError, match="encode_fn is required"):
+                MockLazyShardedDataset(
+                    directory=tmpdir,
+                    encode_fn=None,  # Missing!
+                    pre_packed=False,
+                )
+
+
+class TestLazyShardedDatasetCompletionMarkers:
+    """Tests for completion marker behavior."""
+
+    def test_completion_marker_created(self):
+        """Completion marker should be created after loading chunk."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            chunk_path = Path(tmpdir) / "chunk_00000.jsonl"
+            with open(chunk_path, 'w') as f:
+                f.write(json.dumps({"input_ids": [1], "pack_length": 1}) + '\n')
+
+            dataset = MockLazyShardedDataset(
+                directory=tmpdir,
+                samples_per_chunk=1,
+                pre_packed=True,
+                mark_completed=True,
+                dp_rank=0,
+                dp_world_size=1,
+            )
+
+            # Marker shouldn't exist yet
+            marker_path = chunk_path.with_suffix('.jsonl.completed')
+            assert not marker_path.exists()
+
+            # Load sample (triggers chunk load)
+            _ = dataset[0]
+
+            # Marker should exist now
+            assert marker_path.exists()
+
+    def test_completion_marker_disabled(self):
+        """Completion marker should not be created when disabled."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            chunk_path = Path(tmpdir) / "chunk_00000.jsonl"
+            with open(chunk_path, 'w') as f:
+                f.write(json.dumps({"input_ids": [1], "pack_length": 1}) + '\n')
+
+            dataset = MockLazyShardedDataset(
+                directory=tmpdir,
+                samples_per_chunk=1,
+                pre_packed=True,
+                mark_completed=False,  # Disabled
+                dp_rank=0,
+                dp_world_size=1,
+            )
+
+            _ = dataset[0]
+
+            marker_path = chunk_path.with_suffix('.jsonl.completed')
+            assert not marker_path.exists()
+
+
+class TestLazyShardedDatasetWaiting:
+    """Tests for chunk waiting behavior."""
+
+    def test_timeout_on_missing_chunk(self):
+        """Should timeout and raise error for missing chunk."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dataset = MockLazyShardedDataset(
+                directory=tmpdir,
+                samples_per_chunk=1,
+                pre_packed=True,
+                max_wait_time=0.2,  # Short timeout
+                wait_poll_interval=0.05,
+                dp_rank=0,
+                dp_world_size=1,
+            )
+
+            with pytest.raises(IndexError):
+                _ = dataset[0]  # Chunk doesn't exist
+
+    def test_waits_for_chunk_to_appear(self):
+        """Should wait for chunk to appear within timeout."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dataset = MockLazyShardedDataset(
+                directory=tmpdir,
+                samples_per_chunk=1,
+                pre_packed=True,
+                max_wait_time=2.0,
+                wait_poll_interval=0.1,
+                dp_rank=0,
+                dp_world_size=1,
+            )
+
+            # Write chunk after a delay in another thread
+            def write_chunk_delayed():
+                time.sleep(0.3)
+                chunk_path = Path(tmpdir) / "chunk_00000.jsonl"
+                with open(chunk_path, 'w') as f:
+                    f.write(json.dumps({"input_ids": [42], "pack_length": 1}) + '\n')
+
+            writer_thread = threading.Thread(target=write_chunk_delayed)
+            writer_thread.start()
+
+            # This should wait and then succeed
+            sample = dataset[0]
+            assert sample['input_ids'] == [42]
+
+            writer_thread.join()
+
+
+class TestLazyShardedDatasetCaching:
+    """Tests for chunk caching behavior."""
+
+    def test_chunk_cached_after_load(self):
+        """Chunk should be cached after first load."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            chunk_path = Path(tmpdir) / "chunk_00000.jsonl"
+            with open(chunk_path, 'w') as f:
+                f.write(json.dumps({"input_ids": [1], "pack_length": 1}) + '\n')
+                f.write(json.dumps({"input_ids": [2], "pack_length": 1}) + '\n')
+
+            dataset = MockLazyShardedDataset(
+                directory=tmpdir,
+                samples_per_chunk=2,
+                pre_packed=True,
+                dp_rank=0,
+                dp_world_size=1,
+            )
+
+            assert len(dataset._chunk_cache) == 0
+
+            _ = dataset[0]  # Load first sample
+            assert 0 in dataset._chunk_cache
+            assert len(dataset._chunk_cache[0]) == 2
+
+            _ = dataset[1]  # Should use cache
+            assert len(dataset._chunk_cache) == 1  # Still just one chunk cached
+
+
+class TestEndToEndFlow:
+    """Tests for complete producer-to-dataset flow."""
+
+    def test_packer_to_dataset_flow(self):
+        """Test packing samples and reading via dataset."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Step 1: Create packed chunks using BinPacker
+            packer = BinPacker(packing_length=100)
+
+            samples_batch1 = [
+                EncodedSample(input_ids=[1, 2, 3], labels=[1, 2, 3], length=3),
+                EncodedSample(input_ids=[4, 5], labels=[4, 5], length=2),
+            ]
+            samples_batch2 = [
+                EncodedSample(input_ids=[10, 20, 30, 40], labels=[10, 20, 30, 40], length=4),
+            ]
+
+            pack1 = packer.create_pack(samples_batch1)
+            pack2 = packer.create_pack(samples_batch2)
+
+            # Write chunks
+            chunk0_path = Path(tmpdir) / "chunk_00000.jsonl"
+            with open(chunk0_path, 'w') as f:
+                f.write(json.dumps(pack1) + '\n')
+                f.write(json.dumps(pack2) + '\n')
+
+            # Step 2: Read via dataset
+            dataset = MockLazyShardedDataset(
+                directory=tmpdir,
+                samples_per_chunk=2,
+                pre_packed=True,
+                dp_rank=0,
+                dp_world_size=1,
+            )
+
+            sample0 = dataset[0]
+            assert sample0['input_ids'] == [1, 2, 3, 4, 5]
+            assert sample0['position_ids'] == [0, 1, 2, 0, 1]
+            assert sample0['lengths'] == [3, 2]
+
+            sample1 = dataset[1]
+            assert sample1['input_ids'] == [10, 20, 30, 40]
+
+    def test_multi_rank_distribution(self):
+        """Test that multiple ranks read different chunks."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Create 4 chunks
+            for i in range(4):
+                chunk_path = Path(tmpdir) / f"chunk_{i:05d}.jsonl"
+                pack = {
+                    "input_ids": [i * 100 + j for j in range(5)],
+                    "labels": [i * 100 + j for j in range(5)],
+                    "pack_length": 5,
+                    "chunk_id": i,  # For verification
+                }
+                with open(chunk_path, 'w') as f:
+                    f.write(json.dumps(pack) + '\n')
+
+            # Create datasets for 2 ranks
+            dataset_rank0 = MockLazyShardedDataset(
+                directory=tmpdir,
+                samples_per_chunk=1,
+                pre_packed=True,
+                dp_rank=0,
+                dp_world_size=2,
+            )
+            dataset_rank1 = MockLazyShardedDataset(
+                directory=tmpdir,
+                samples_per_chunk=1,
+                pre_packed=True,
+                dp_rank=1,
+                dp_world_size=2,
+            )
+
+            # Rank 0 should get chunks 0, 2
+            sample_r0_0 = dataset_rank0[0]  # -> chunk 0
+            assert sample_r0_0['chunk_id'] == 0
+
+            sample_r0_1 = dataset_rank0[1]  # -> chunk 2
+            assert sample_r0_1['chunk_id'] == 2
+
+            # Rank 1 should get chunks 1, 3
+            sample_r1_0 = dataset_rank1[0]  # -> chunk 1
+            assert sample_r1_0['chunk_id'] == 1
+
+            sample_r1_1 = dataset_rank1[1]  # -> chunk 3
+            assert sample_r1_1['chunk_id'] == 3
+
+
+class TestErrorHandling:
+    """Tests for error handling scenarios."""
+
+    def test_corrupt_json_skipped(self):
+        """Corrupt JSON lines should be skipped gracefully."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            chunk_path = Path(tmpdir) / "chunk_00000.jsonl"
+            with open(chunk_path, 'w') as f:
+                f.write(json.dumps({"input_ids": [1], "pack_length": 1}) + '\n')
+                f.write("not valid json\n")  # Corrupt line
+                f.write(json.dumps({"input_ids": [2], "pack_length": 1}) + '\n')
+
+            dataset = MockLazyShardedDataset(
+                directory=tmpdir,
+                samples_per_chunk=3,
+                pre_packed=True,
+                dp_rank=0,
+                dp_world_size=1,
+            )
+
+            # Should load 2 valid samples, skip corrupt one
+            samples = dataset._load_chunk(0)
+            assert len(samples) == 2
+            assert samples[0]['input_ids'] == [1]
+            assert samples[1]['input_ids'] == [2]
+
+    def test_empty_chunk_file(self):
+        """Empty chunk file should return empty samples."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            chunk_path = Path(tmpdir) / "chunk_00000.jsonl"
+            chunk_path.touch()  # Empty file
+
+            dataset = MockLazyShardedDataset(
+                directory=tmpdir,
+                samples_per_chunk=1,
+                pre_packed=True,
+                dp_rank=0,
+                dp_world_size=1,
+            )
+
+            samples = dataset._load_chunk(0)
+            assert samples == []
+
+    def test_encode_fn_returns_none(self):
+        """Samples where encode_fn returns None should be skipped."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            chunk_path = Path(tmpdir) / "chunk_00000.jsonl"
+            with open(chunk_path, 'w') as f:
+                f.write(json.dumps({"valid": True}) + '\n')
+                f.write(json.dumps({"valid": False}) + '\n')
+                f.write(json.dumps({"valid": True}) + '\n')
+
+            def selective_encode(sample):
+                if sample.get('valid'):
+                    return {'input_ids': [1], 'length': 1}
+                return None  # Skip invalid
+
+            dataset = MockLazyShardedDataset(
+                directory=tmpdir,
+                encode_fn=selective_encode,
+                samples_per_chunk=3,
+                pre_packed=False,
+                dp_rank=0,
+                dp_world_size=1,
+            )
+
+            samples = dataset._load_chunk(0)
+            assert len(samples) == 2  # Only valid ones
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])
