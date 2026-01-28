@@ -82,6 +82,16 @@ class SwiftSft(SwiftPipeline, TunerMixin):
     def _get_dataset(self):
         # The random shuffling of the training set occurs in the dataloader of the trainer.
         args = self.args
+
+        # Skip HuggingFace dataset loading for sharded_lazy mode.
+        # LazyShardedDataset handles loading directly in _post_process_datasets().
+        # Without this check, load_dataset() would load ALL JSONL files and run
+        # a Map phase (20+ minutes for large datasets), only to throw it away.
+        if getattr(args, 'sharded_lazy', False):
+            logger.info('[sharded_lazy] Skipping HuggingFace dataset loading - LazyShardedDataset will load lazily')
+            # Return placeholder dataset - will be replaced in _post_process_datasets
+            return HfDataset.from_dict({'__sharded_lazy_placeholder__': [0]}), None
+
         dataset_kwargs = args.get_dataset_kwargs()
         train_dataset, val_dataset = None, None
         if args.dataset:
